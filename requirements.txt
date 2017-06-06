@@ -53,7 +53,9 @@ prompt-toolkit==1.0.14
 psutil==4.3.0
 psycopg2==2.6.1
 ptyprocess==0.5.1
-pycsw==2.1.dev20161019
+git+git://github.com/geopython/pycsw.git@6ef219a9c369004e715f83a3e934bb0ff82ee562#egg=pycsw
+sqlalchemy
+#pycsw==2.1.dev20161019
 pyflakes==1.0.0
 Pygments==2.2.0
 pyparsing==2.2.0

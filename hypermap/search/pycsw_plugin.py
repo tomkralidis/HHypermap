@@ -29,13 +29,13 @@
 # =================================================================
 
 import inspect
+import json
 import logging
 
-from django.db import connection
-from django.db.models import Max, Min, Count
 from django.conf import settings
 
 from pycsw.core import util
+import requests
 from hypermap.aggregator.models import Catalog, Layer, Service, Endpoint, SpatialReferenceSystem
 from hypermap.aggregator.utils import create_layer_from_metadata_xml
 from hypermap.aggregator.tasks import index_layer
@@ -105,17 +105,14 @@ class HHypermapRepository(object):
         self.fts = False
         self.label = 'HHypermap'
         self.local_ingest = True
+#        self.url = settings.SEARCH_URL
+        self.url = 'http://elasticsearch:9200/hypermap'
 
         self.dbtype = settings.DATABASES['default']['ENGINE'].split('.')[-1]
 
         # HHypermap PostgreSQL installs are PostGIS enabled
         if self.dbtype == 'postgis':
             self.dbtype = 'postgresql+postgis+wkt'
-
-        if self.dbtype in ['sqlite', 'sqlite3']:  # load SQLite query bindings
-            connection.connection.create_function('query_spatial', 4, util.query_spatial)
-            connection.connection.create_function('get_anytext', 1, util.get_anytext)
-            connection.connection.create_function('get_geometry_area', 1, util.get_geometry_area)
 
         # generate core queryables db and obj bindings
         self.queryables = {}
@@ -143,69 +140,127 @@ class HHypermapRepository(object):
         ''' Stub to mock a pycsw dataset object for Transactions'''
         return type('Service', (object,), {})
 
-    def query_ids(self, ids):
-        ''' Query by list of identifiers '''
-        return self._get_repo_filter(Layer.objects).filter(uuid__in=ids).all()
-
     def query_domain(self, domain, typenames, domainquerytype='list', count=False):
         ''' Query by property domain values '''
 
-        objects = self._get_repo_filter(Layer.objects)
+        # objects = self._get_repo_filter(Layer.objects)
 
         if domainquerytype == 'range':
-            return [tuple(objects.aggregate(Min(domain), Max(domain)).values())]
+            url = '{}/_field_stats'.format(self.url)
+
+            params = {
+                'fields': domain
+            }
+
+            response = requests.get(url, params=params).json()
+            LOGGER.info(response)
+            LOGGER.info(response)
+
+            min_ = response['indices']['_all']['fields'][domain]['min_value']
+            max_ = response['indices']['_all']['fields'][domain]['max_value']
+
+            return [(min_, max_)]
+
         else:
-            if count:
-                return [(d[domain], d['%s__count' % domain])
-                        for d in objects.values(domain).annotate(Count(domain))]
-            else:
-                return objects.values_list(domain).distinct()
+            url = '{}/_search'.format(self.url)
+
+            data = {
+                'size': 0,
+                'aggs': {
+                    'domain': {
+                        'terms': {
+                            'field': domain
+                        }
+                    }
+                }
+            }
+
+            LOGGER.info('data %s', data)
+            response = requests.post(url, json=data).json()
+
+            out = []
+            for b in response['aggregations']['domain']['buckets']:
+                out.append((b['key'], b['doc_count']))
+
+            return out
 
     def query_insert(self, direction='max'):
         ''' Query to get latest (default) or earliest update to repository '''
+
+        url = '{}/_search'.format(self.url)
+
+        field = 'layer_date'
+
         if direction == 'min':
-            return Layer.objects.aggregate(
-                Min('last_updated'))['last_updated__min'].strftime('%Y-%m-%dT%H:%M:%SZ')
-        return self._get_repo_filter(Layer.objects).aggregate(
-            Max('last_updated'))['last_updated__max'].strftime('%Y-%m-%dT%H:%M:%SZ')
+            direction = 'asc'
+        else:
+            direction = 'desc'
+
+        params = {
+            'sort': '{}:{}'.format(field, direction),
+            '_source': field,
+            'size': 1,
+        }
+
+        response = requests.get(url, params=params).json()
+        latest_insert = response['hits']['hits'][0]['_source'][field]
+        return latest_insert
 
     def query_source(self, source):
         ''' Query by source '''
         return self._get_repo_filter(Layer.objects).filter(url=source)
 
-    def query(self, constraint, sortby=None, typenames=None, maxrecords=10, startposition=0):
+    def query_ids(self, ids):
+        ''' Query by identifiers '''
+
+        return self.query({}, ids=ids)[1]
+
+    def query(self, constraint, sortby=None, typenames=None, maxrecords=10, startposition=0, ids=[]):
         ''' Query records from underlying repository '''
 
-        # run the raw query and get total
-        if 'where' in constraint:  # GetRecords with constraint
-            query = self._get_repo_filter(Layer.objects).extra(where=[constraint['where']], params=constraint['values'])
+        params = {}
+        results = []
+        url = '{}/_search'.format(self.url)
 
-        else:  # GetRecords sans constraint
-            query = self._get_repo_filter(Layer.objects)
+        LOGGER.info('Constraint: %s', constraint)
+#        LOGGER.info('RAW %r', constraint)
 
-        total = query.count()
+        if ids:
+            id_ = ids[0]
+            if 'service:' in id_:
+                id_ = 'service_id'
+            LOGGER.info('ids based search')
+            params['q'] = 'id:{}'.format(id_)
+        else:
+            params['size'] = maxrecords
+            params['from'] = startposition 
 
-        # apply sorting, limit and offset
-        if sortby is not None:
-            if 'spatial' in sortby and sortby['spatial']:  # spatial sort
-                desc = False
-                if sortby['order'] == 'DESC':
-                    desc = True
-                query = query.all()
-                return [str(total),
-                        sorted(query,
-                               key=lambda x: float(util.get_geometry_area(getattr(x, sortby['propertyname']))),
-                               reverse=desc,
-                               )[startposition:startposition+int(maxrecords)]]
-            else:
-                if sortby['order'] == 'DESC':
-                    pname = '-%s' % sortby['propertyname']
-                else:
-                    pname = sortby['propertyname']
-                return [str(total),
-                        query.order_by(pname)[startposition:startposition+int(maxrecords)]]
-        else:  # no sort
-            return [str(total), query.all()[startposition:startposition+int(maxrecords)]]
+            if 'where' in constraint:
+                params['q'] = constraint['where'] % tuple(constraint['values'])
+            else:  # empty query
+                LOGGER.info('No filter specified')
+
+            if sortby is not None:
+                sortvalue = '{}:{}'.format(sortby['propertyname'], sortby['order'].lower())
+                params['sort'] = sortvalue
+
+        LOGGER.info('QUERY: %r', params)
+        response = requests.get(url, params=params).json()
+        LOGGER.info('Elasticsearch response %s', response)
+
+        es_response = response['hits']['hits']
+        count = response['hits']['total']
+
+        for hit in es_response:
+            result = hit['_source']
+            result['id_string'] = result['id']
+            result['wkt_geometry'] = result['bbox']
+            result['type'] = result['service_type']
+            result['csw_type'] = 'dataset'
+            result['download_links'] = _make_download_links(result)
+            results.append(type('', (object,), result)())
+
+        return [str(count), results]
 
     def insert(self, resourcetype, source, insert_date=None):
         ''' Insert a record into the repository '''
@@ -261,7 +316,7 @@ class HHypermapRepository(object):
 
                 res.save()
 
-                LOGGER.debug('Indexing layer with id %s on search engine' % res.uuid)
+                LOGGER.debug('Indexing layer with id %s on search engine' % res.id)
                 index_layer(res, use_cache=True)
 
             else:
@@ -307,3 +362,25 @@ class HHypermapRepository(object):
         if self.filter is not None:
             return query.extra(where=[self.filter])
         return query
+
+
+def _make_download_links(result):
+    """create pycsw download links column from HH result"""
+
+    # format n,d,p,u[^]
+
+    service_link = [
+        result['name'],
+        result['name'],
+        result['service_type'],
+        result['url']
+    ]
+
+    www_link = [
+        result['name'],
+        result['name'],
+        'WWW:LINK',
+        '{}{}'.format(settings.SITE_URL, result['location']['layer_info'])
+    ]
+
+    return '^'.join([','.join(service_link), ','.join(www_link)])
